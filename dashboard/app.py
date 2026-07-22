@@ -5,6 +5,7 @@ Streamlit app visualizing e-commerce sales & customer analytics.
 
 import os
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 from sqlalchemy import create_engine, text
 from urllib.parse import quote_plus
@@ -161,3 +162,137 @@ with col2:
     st.dataframe(df_delivery)
 
 st.caption("Key insight: late deliveries correlate with meaningfully lower review scores.")
+
+st.divider()
+
+# ============================================
+# 5. Revenue & Delivery Performance by State
+# ============================================
+st.header("Revenue & Delivery Performance by State")
+
+state_query = """
+WITH state_metrics AS (
+    SELECT
+        customer_state,
+        SUM(order_total_value) AS revenue,
+        COUNT(DISTINCT order_id) AS num_orders,
+        ROUND(AVG(delivery_delay_days), 2) AS avg_delivery_delay_days,
+        ROUND(AVG(review_score), 2) AS avg_review_score
+    FROM order_summary
+    WHERE order_status = 'delivered'
+    GROUP BY customer_state
+),
+state_geo AS (
+    SELECT
+        geolocation_state AS state,
+        ROUND(AVG(geolocation_lat), 6) AS lat,
+        ROUND(AVG(geolocation_lng), 6) AS lng
+    FROM geolocation
+    GROUP BY geolocation_state
+)
+SELECT
+    sm.customer_state AS state,
+    sm.revenue,
+    sm.num_orders,
+    sm.avg_delivery_delay_days,
+    sm.avg_review_score,
+    sg.lat,
+    sg.lng
+FROM state_metrics sm
+LEFT JOIN state_geo sg ON sm.customer_state = sg.state
+ORDER BY sm.revenue DESC;
+"""
+
+df_state = pd.read_sql(text(state_query), engine).dropna(subset=["lat", "lng"])
+
+fig_state = px.scatter_geo(
+    df_state,
+    lat="lat",
+    lon="lng",
+    size="revenue",
+    color="avg_delivery_delay_days",
+    color_continuous_scale="RdYlGn_r",
+    hover_name="state",
+    hover_data={"revenue": ":,.2f", "num_orders": True, "avg_review_score": True, "lat": False, "lng": False},
+    scope="south america",
+    title="Bubble size = revenue, color = avg delivery delay (days, negative = early)",
+)
+fig_state.update_geos(showcountries=True, fitbounds="locations")
+st.plotly_chart(fig_state, use_container_width=True)
+
+with st.expander("View raw state data"):
+    st.dataframe(df_state)
+
+st.divider()
+
+# ============================================
+# 6. Seller Performance
+# ============================================
+st.header("Seller Performance: Late Shipments vs. Review Score")
+
+seller_query = """
+WITH seller_orders AS (
+    SELECT
+        oi.seller_id,
+        oi.order_id,
+        oi.price,
+        (o.order_delivered_carrier_date > oi.shipping_limit_date) AS is_late_shipment,
+        (o.order_delivered_carrier_date IS NOT NULL) AS has_carrier_date
+    FROM order_items oi
+    JOIN orders o ON oi.order_id = o.order_id
+    WHERE o.order_status = 'delivered'
+),
+seller_agg AS (
+    SELECT
+        seller_id,
+        COUNT(DISTINCT order_id) AS num_orders,
+        SUM(price) AS total_revenue,
+        ROUND(
+            COUNT(*) FILTER (WHERE is_late_shipment)::NUMERIC
+            / NULLIF(COUNT(*) FILTER (WHERE has_carrier_date), 0) * 100
+        , 2) AS late_shipment_rate_pct
+    FROM seller_orders
+    GROUP BY seller_id
+),
+seller_review_agg AS (
+    SELECT
+        oi.seller_id,
+        ROUND(AVG(r.review_score), 2) AS avg_review_score
+    FROM order_items oi
+    JOIN reviews r ON oi.order_id = r.order_id
+    GROUP BY oi.seller_id
+)
+SELECT
+    sa.seller_id,
+    sa.num_orders,
+    sa.total_revenue,
+    sa.late_shipment_rate_pct,
+    sr.avg_review_score
+FROM seller_agg sa
+LEFT JOIN seller_review_agg sr ON sa.seller_id = sr.seller_id
+WHERE sa.num_orders >= 5
+ORDER BY sa.total_revenue DESC;
+"""
+
+df_seller = pd.read_sql(text(seller_query), engine)
+
+fig_seller = px.scatter(
+    df_seller,
+    x="late_shipment_rate_pct",
+    y="avg_review_score",
+    size="total_revenue",
+    hover_name="seller_id",
+    title="Each point is a seller (5+ delivered orders) — size = total revenue",
+    labels={"late_shipment_rate_pct": "Late shipment rate (%)", "avg_review_score": "Avg review score"},
+)
+st.plotly_chart(fig_seller, use_container_width=True)
+
+col1, col2 = st.columns(2)
+with col1:
+    st.subheader("Top 10 sellers by revenue")
+    st.dataframe(df_seller.sort_values("total_revenue", ascending=False).head(10))
+with col2:
+    st.subheader("Worst 10 sellers by late shipment rate")
+    st.dataframe(df_seller.sort_values("late_shipment_rate_pct", ascending=False).head(10))
+
+st.caption("Key insight: sellers with higher late-shipment rates trend toward lower average review scores.")
